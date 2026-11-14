@@ -1,0 +1,510 @@
+-- the settings are already set (free to change)
+
+local players = game:GetService("Players")
+local runservice = game:GetService("RunService")
+local userinputservice = game:GetService("UserInputService")
+local vrservice = game:GetService("VRService")
+local workspace = game:GetService("Workspace")
+
+local player = players.LocalPlayer 
+local camera = workspace.CurrentCamera
+
+local head_scale            = 3
+
+local max_arm_length        = 5
+local unstick_distance      = 3.5
+local velocity_history_size = 6
+local velocity_limit        = 20
+local max_jump_speed        = 100
+local jump_multiplier       = 1.1
+local default_slide_factor  = 0.03
+local default_precision     = 0.995
+local gravity               = 90
+
+local hand_radius           = 0.1
+local head_radius           = 0.05
+local body_radius           = 0.9
+local body_drop             = 0.8
+
+local left_hand_offset      = Vector3.new(0, 0, 0)
+local right_hand_offset     = Vector3.new(0, 0, 0)
+
+local body_color            = Color3.fromRGB(128, 128, 128)
+local hand_color            = Color3.fromRGB(128, 128, 128)
+
+local character, humanoid, hrp
+local rigpos = Vector3.zero
+local spawnpos = Vector3.zero
+local velocity = Vector3.zero
+local lastheadposition = Vector3.zero
+local lastposition = Vector3.zero
+local velocityhistory = table.create(velocity_history_size, Vector3.zero)
+local velocityindex = 0
+local denormalizedvelocityaverage = Vector3.zero
+local needsinit = true
+local scale = 1
+
+local folder = Instance.new("Folder")
+folder.Name = "GorillaVisuals"
+folder.Parent = workspace
+
+local rayparams = RaycastParams.new()
+rayparams.FilterType = Enum.RaycastFilterType.Exclude
+rayparams.RespectCanCollide = true
+
+local overlapparams = OverlapParams.new()
+overlapparams.FilterType = Enum.RaycastFilterType.Exclude
+overlapparams.RespectCanCollide = true
+
+local function makehand(name, input, offset)
+	local ball = Instance.new("Part")
+	ball.Name = name .. "Hand"
+	ball.Shape = Enum.PartType.Ball
+	ball.Material = Enum.Material.SmoothPlastic
+	ball.Color = hand_color
+	ball.Size = Vector3.one * hand_radius
+	ball.Anchored = true
+	ball.CanCollide = false
+	ball.CanQuery = false
+	ball.CanTouch = false
+	ball.CastShadow = false
+	ball.Parent = folder
+	return {
+		input = input,
+		offset = offset,
+		ball = ball,
+		last = Vector3.zero,
+		was = false,
+		colliding = false,
+		first = Vector3.zero,
+		cf = CFrame.new(),
+	}
+end
+
+local lefthand = makehand("Left", Enum.UserCFrame.LeftHand, left_hand_offset)
+local righthand = makehand("Right", Enum.UserCFrame.RightHand, right_hand_offset)
+local hands = { lefthand, righthand }
+
+pcall(function()
+	vrservice.AvatarGestures = false
+end)
+
+task.spawn(function()
+	pcall(function()
+		local playermodule = require(player:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule"))
+		playermodule:GetControls():Disable()
+	end)
+end)
+
+local function hidecharacter(char)
+	local function hide(d)
+		if d:IsA("BasePart") then
+			d.Transparency = 1
+		elseif d:IsA("Decal") or d:IsA("Texture") then
+			d.Transparency = 1
+		end
+	end
+	for _, d in char:GetDescendants() do
+		hide(d)
+	end
+	char.DescendantAdded:Connect(hide)
+end
+
+local function setupcharacter(char)
+	character = char
+	humanoid = char:WaitForChild("Humanoid")
+	hrp = char:WaitForChild("HumanoidRootPart")
+
+	rayparams.FilterDescendantsInstances = { char, folder }
+	overlapparams.FilterDescendantsInstances = { char, folder }
+
+	humanoid.PlatformStand = true
+	hrp.Anchored = true
+	hidecharacter(char)
+
+	local flooroffset = hrp.Size.Y / 2 + humanoid.HipHeight
+	spawnpos = hrp.Position - Vector3.new(0, flooroffset, 0)
+	rigpos = spawnpos
+	velocity = Vector3.zero
+	needsinit = true
+end
+
+player.CharacterAdded:Connect(setupcharacter)
+if player.Character then
+	task.spawn(setupcharacter, player.Character)
+end
+
+local function spherecast(origin, radius, dir, len)
+	if len <= 1e-5 or radius <= 0 then
+		return nil
+	end
+	return workspace:Spherecast(origin, radius, dir * len, rayparams)
+end
+
+local function raycast(origin, dir, len)
+	if len <= 1e-5 then
+		return nil
+	end
+	return workspace:Raycast(origin, dir * len, rayparams)
+end
+
+local function collisionsspherecast(startpos, radius, movement, precision)
+	local mag = movement.Magnitude
+	if mag < 1e-6 then
+		return false, Vector3.zero, nil
+	end
+	local dir = movement / mag
+
+	local hit = spherecast(startpos, radius * precision, dir, mag + radius * (1 - precision))
+	if hit then
+		local finalpos = hit.Position + hit.Normal * radius
+
+		local tofinal = finalpos - startpos
+		local tm = tofinal.Magnitude
+		if tm > 1e-6 then
+			local td = tofinal / tm
+			local pp = precision * precision
+			local inner = spherecast(startpos, radius * pp, td, tm + radius * (1 - pp))
+			if inner then
+				finalpos = startpos + td * math.max(0, hit.Distance - radius * (1 - pp))
+				hit = inner
+			else
+				local rc = raycast(startpos, td, tm + radius * pp * 0.999)
+				if rc then
+					return true, startpos, rc
+				end
+			end
+		end
+		return true, finalpos, hit
+	end
+
+	local rc = raycast(startpos, dir, mag + radius * precision * 0.999)
+	if rc then
+		return true, startpos, rc
+	end
+
+	return false, Vector3.zero, nil
+end
+
+local function iterativecollisionspherecast(startpos, radius, movement, precision, singlehand)
+	local hit, endpos, res = collisionsspherecast(startpos, radius * precision, movement, precision)
+
+	if hit then
+		local firstpos = endpos
+		local slip = res.Instance and res.Instance:GetAttribute("SlipPercentage")
+		if type(slip) ~= "number" then
+			slip = (not singlehand) and default_slide_factor or 0.001
+		end
+
+		local n = res.Normal
+		local remaining = startpos + movement - firstpos
+		local projected = (remaining - n * remaining:Dot(n)) * slip
+
+		local h2, e2 = collisionsspherecast(endpos, radius, projected, precision * precision)
+		if h2 then
+			return true, e2
+		end
+
+		local from = projected + firstpos
+		local h3, e3 = collisionsspherecast(from, radius, startpos + movement - from, precision * precision * precision)
+		if h3 then
+			return true, e3
+		end
+
+		return true, firstpos
+	end
+
+	local mag = movement.Magnitude
+	if mag > 1e-6 then
+		local bigger = (movement / mag) * (mag + radius * precision * 0.34)
+		local h4 = collisionsspherecast(startpos, radius * precision * 0.66, bigger, precision * 0.66)
+		if h4 then
+			return true, startpos
+		end
+	end
+
+	return false, Vector3.zero
+end
+
+local headlocal = Vector3.zero
+
+local function headworld()
+	return rigpos + headlocal
+end
+
+local function handcurrent(h)
+	local cf = h.cf
+	local p = rigpos + (cf.Position + cf.Rotation * h.offset) * scale
+	local hp = headworld()
+	local v = p - hp
+	local maxlen = max_arm_length * scale
+	if v.Magnitude < maxlen then
+		return p
+	end
+	return hp + v.Unit * maxlen
+end
+
+local function bodyspheres()
+	local hp = headworld()
+	return {
+		{ hp, head_radius * scale },
+		{ hp - Vector3.new(0, body_drop * scale, 0), body_radius * scale },
+	}
+end
+
+local function depenetrate()
+	for _ = 1, 3 do
+		local push = Vector3.zero
+		for _, s in bodyspheres() do
+			local center, r = s[1], s[2]
+			for _, part in workspace:GetPartBoundsInRadius(center, r, overlapparams) do
+				local closest = part:GetClosestPointOnSurface(center)
+				local diff = center - closest
+				local d = diff.Magnitude
+				if d > 1e-3 then
+					if d < r then
+						push += diff.Unit * (r - d)
+					end
+				else
+					push += Vector3.yAxis * r
+				end
+			end
+		end
+		if push.Magnitude < 1e-4 then
+			return
+		end
+		rigpos += push
+	end
+end
+
+local function moverig(delta)
+	for _ = 1, 3 do
+		local mag = delta.Magnitude
+		if mag < 1e-4 then
+			break
+		end
+		local dir = delta / mag
+
+		local best
+		for _, s in bodyspheres() do
+			local hit = spherecast(s[1], s[2], dir, mag)
+			if hit and (not best or hit.Distance < best.Distance) then
+				best = hit
+			end
+		end
+
+		if not best then
+			rigpos += delta
+			break
+		end
+
+		local travel = math.max(best.Distance - 0.02, 0)
+		rigpos += dir * travel
+
+		local n = best.Normal
+		local vn = velocity:Dot(n)
+		if vn < 0 then
+			velocity -= n * vn
+		end
+
+		local rest = delta - dir * travel
+		delta = rest - n * rest:Dot(n)
+	end
+end
+
+local function storevelocities(dt)
+	velocityindex = (velocityindex % velocity_history_size) + 1
+	local oldest = velocityhistory[velocityindex]
+	local current = (rigpos - lastposition) / dt
+	denormalizedvelocityaverage += (current - oldest) / velocity_history_size
+	velocityhistory[velocityindex] = current
+	lastposition = rigpos
+end
+
+runservice.RenderStepped:Connect(function(dt)
+	dt = math.clamp(dt, 1 / 240, 1 / 30)
+
+	if camera.HeadScale ~= head_scale then
+		camera.HeadScale = head_scale
+	end
+	scale = camera.HeadScale
+	camera.CameraType = Enum.CameraType.Scriptable
+
+	local function onhandtouch(h)
+		local motor = (h == lefthand) and Enum.VibrationMotor.LeftHand or Enum.VibrationMotor.RightHand
+		pcall(function()
+			game.HapticService:SetMotor(Enum.UserInputType.Gamepad1, motor, 0.6)
+		end)
+		h.buzzid = (h.buzzid or 0) + 1
+		local id = h.buzzid
+		task.delay(0.06, function()
+			if h.buzzid == id then
+				pcall(function()
+					game.HapticService:SetMotor(Enum.UserInputType.Gamepad1, motor, 0)
+				end)
+			end
+		end)
+
+		if script.step then
+			local s = script.step:Clone()
+			s.Parent = h.ball
+			s:Play()
+			s.Ended:Once(function()
+				s:Destroy()
+			end)
+			task.delay(5, function()
+				if s.Parent then
+					s:Destroy()
+				end
+			end)
+		end
+	end
+
+	local headcf = userinputservice:GetUserCFrame(Enum.UserCFrame.Head)
+	headlocal = headcf.Position * scale
+	for _, h in hands do
+		h.cf = userinputservice:GetUserCFrame(h.input)
+	end
+
+	local handradius = hand_radius * scale
+	local headradius = head_radius * scale
+
+	if needsinit then
+		needsinit = false
+		velocityhistory = table.create(velocity_history_size, Vector3.zero)
+		denormalizedvelocityaverage = Vector3.zero
+		lastheadposition = headworld()
+		lastposition = rigpos
+		for _, h in hands do
+			h.last = handcurrent(h)
+			h.was = false
+			h.colliding = false
+		end
+	end
+
+	if rigpos.Y < workspace.FallenPartsDestroyHeight + 50 then
+		rigpos = spawnpos
+		velocity = Vector3.zero
+		needsinit = true
+		return
+	end
+
+	velocity += Vector3.new(0, -gravity, 0) * dt
+	depenetrate()
+	moverig(velocity * dt)
+
+	local gravitystep = Vector3.new(0, -1, 0) * 2 * gravity * dt * dt
+
+	for _, h in hands do
+		h.colliding = false
+		h.first = Vector3.zero
+
+		local cur = handcurrent(h)
+		local traveled = cur - h.last + gravitystep
+		local hit, finalpos = iterativecollisionspherecast(h.last, handradius, traveled, default_precision, true)
+		if hit then
+			if h.was then
+				h.first = h.last - cur
+			else
+				h.first = finalpos - cur
+			end
+			velocity = Vector3.zero
+			h.colliding = true
+		end
+	end
+
+	local rigmovement
+	if (lefthand.colliding or lefthand.was) and (righthand.colliding or righthand.was) then
+		rigmovement = (lefthand.first + righthand.first) / 2
+	else
+		rigmovement = lefthand.first + righthand.first
+	end
+
+	local headpos = headworld()
+	local headhit, headfinal = iterativecollisionspherecast(
+		lastheadposition, headradius, headpos + rigmovement - lastheadposition, default_precision, false
+	)
+	if headhit then
+		rigmovement = headfinal - lastheadposition
+		local d = headpos - lastheadposition + rigmovement
+		local dm = d.Magnitude
+		if dm > 1e-6 then
+			local rc = raycast(lastheadposition, d / dm, dm + headradius * default_precision * 0.999)
+			if rc then
+				rigmovement = lastheadposition - headpos
+			end
+		end
+	end
+
+	if rigmovement ~= Vector3.zero then
+		rigpos += rigmovement
+	end
+
+	lastheadposition = headworld()
+
+	for _, h in hands do
+		local cur = handcurrent(h)
+		local single = not ((lefthand.colliding or lefthand.was) and (righthand.colliding or righthand.was))
+		local hit, finalpos = iterativecollisionspherecast(h.last, handradius, cur - h.last, default_precision, single)
+		if hit then
+			h.last = finalpos
+			h.colliding = true
+		else
+			h.last = cur
+		end
+	end
+
+	storevelocities(dt)
+
+	if lefthand.colliding or righthand.colliding then
+		local avg = denormalizedvelocityaverage
+		local mag = avg.Magnitude
+		if mag > velocity_limit then
+			if mag * jump_multiplier > max_jump_speed then
+				velocity = (avg / mag) * max_jump_speed
+			else
+				velocity = jump_multiplier * avg
+			end
+		end
+	end
+
+	for _, h in hands do
+		if h.colliding then
+			local cur = handcurrent(h)
+			if (cur - h.last).Magnitude > unstick_distance * scale then
+				local hp = headworld()
+				local tohand = cur - hp
+				local len = tohand.Magnitude - handradius
+				local blocked = len > 1e-5
+					and spherecast(hp, handradius * default_precision, tohand.Unit, len)
+			end
+		end
+	end
+
+	for _, h in hands do
+		if h.colliding and not h.was then
+			onhandtouch(h)
+		end
+		h.was = h.colliding
+	end
+
+	camera.CFrame = CFrame.new(rigpos)
+
+	for _, h in hands do
+		h.ball.Size = Vector3.one * handradius * 2
+		h.ball.CFrame = CFrame.new(h.last) * h.cf.Rotation
+	end
+
+	local headnow = headworld()
+	local look = headcf.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	if flat.Magnitude < 0.3 then
+		local up = headcf.UpVector
+		flat = Vector3.new(up.X, 0, up.Z) * (look.Y < 0 and 1 or -1)
+	end
+	local yaw = 0
+	if flat.Magnitude > 1e-3 then
+		flat = flat.Unit
+		yaw = math.atan2(-flat.X, -flat.Z)
+	end
+end)

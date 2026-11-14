@@ -1,4 +1,4 @@
--- the settings are already set (free to change)
+-- SO basically i got motivation from Abnumality on roblox where he ported the C# locomotion too. the settings are already set (free to change)
 
 local players = game:GetService("Players")
 local runservice = game:GetService("RunService")

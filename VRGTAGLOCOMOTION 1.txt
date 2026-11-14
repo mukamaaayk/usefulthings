@@ -344,20 +344,6 @@ runservice.RenderStepped:Connect(function(dt)
 				end)
 			end
 		end)
-
-		if script.step then
-			local s = script.step:Clone()
-			s.Parent = h.ball
-			s:Play()
-			s.Ended:Once(function()
-				s:Destroy()
-			end)
-			task.delay(5, function()
-				if s.Parent then
-					s:Destroy()
-				end
-			end)
-		end
 	end
 
 	local headcf = userinputservice:GetUserCFrame(Enum.UserCFrame.Head)
